@@ -30,8 +30,8 @@ kind `plan`) before any claim, with `refused: <id>` issued to the `ferryman` pro
 with alias and role checks; and `ferry agent approve`.
 
 Not yet wired:
-- Names in the Telegram notices, the dashboard (`ferry dashboard`, ferryman-server), the MCP
-  output (the join list still shows identities) and `ferry engines`.
+- Names in the Telegram notices, the dashboard (`ferry dashboard`, ferryman-server) and the MCP
+  output (the join list still shows identities). `ferry engines` now shows names.
 - Approving an enrolment from Telegram (Approve/Deny buttons) or the dashboard. Today only
   `ferry agent approve <identity>` does it, from the command line.
 - A test of the `refused: <id>` order end to end: it needs a ferry root with a `ferryman`

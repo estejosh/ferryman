@@ -3903,10 +3903,13 @@ fn engines_command(at: &Targets, as_json: bool) -> Result<()> {
         return Ok(());
     }
     let now = chrono::Utc::now();
+    let names = ferryman_channel::names::Names::here();
     for (inventory, check, channels) in rows.values() {
         println!(
             "{} on {}  (updated {} ago, {:?}, {} channel(s))",
-            inventory.agent,
+            names
+                .as_ref()
+                .map_or_else(|| inventory.agent.clone(), |n| n.label(&inventory.agent)),
             inventory.machine,
             ferryman_channel::receipts::short_age(now - inventory.updated_at),
             check,
