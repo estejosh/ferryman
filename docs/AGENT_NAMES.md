@@ -22,15 +22,17 @@ changes nothing.
 
 ## Status
 
-Done and tested: the names file loader, retirement (claim refusal, roster `retired` filter,
-`access show --all`), the charter block at the top of every worker prompt, the deterministic
-worker refusal (`ask:`, `vps:`, kind `plan`) with `refused: <id>` to Charon, enrolment with
-alias and role checks, and `ferry agent approve`.
+Done and tested: the names file loader; retirement (claim refusal with the date, roster
+`retired` filter, `access show --all`, the MCP alive list and `to` check); names in
+`ferry access show` and `ferry work list`; the charter block at the top of
+every worker prompt; `ferry agent charter`; the deterministic worker refusal (`ask:`, `vps:`,
+kind `plan`) before any claim, with `refused: <id>` issued to the `ferryman` project; enrolment
+with alias and role checks; and `ferry agent approve`.
 
-Not yet wired (the order asked for these; they are the next work):
-- Names in the dashboard, Telegram notices, `ferry work list`, `ferry engines`, and the MCP
-  output (only `ferry access show` and the MCP `to` check use them today).
-- Hiding retired identities in the pickers: `read_agent_roster_visible` exists but no picker
-  calls it yet.
-- Approving an enrolment from Telegram (Approve/Deny buttons) or the dashboard; today only
-  `ferry agent approve <identity>` does it.
+Not yet wired:
+- Names in the Telegram notices, the dashboard (`ferry dashboard`, ferryman-server), the MCP
+  output (the join list still shows identities) and `ferry engines`.
+- Approving an enrolment from Telegram (Approve/Deny buttons) or the dashboard. Today only
+  `ferry agent approve <identity>` does it, from the command line.
+- A test of the `refused: <id>` order end to end: it needs a ferry root with a `ferryman`
+  project, so it is checked by hand, not by `cargo test`.

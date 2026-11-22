@@ -932,7 +932,8 @@ impl Agent {
     /// The route with the roster as it is now.
     fn route(&self) -> ProjectRoute {
         let mut route = self.route.clone();
-        if let Ok(agents) = ferryman_channel::read_agent_roster(&route.communications) {
+        // Retired identities are not on the list anyone can be sent to.
+        if let Ok(agents) = ferryman_channel::read_agent_roster_visible(&route.communications) {
             route.agents = agents;
         }
         route

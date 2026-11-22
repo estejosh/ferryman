@@ -10177,18 +10177,23 @@ fn work_command(command: WorkCommand) -> Result<()> {
         WorkCommand::List { workspace, json } => {
             let route = ferryman_channel::route_for(&here(workspace)?)?;
             let entries = handin::list(&route, &handin::work_dir(&route))?;
+            // People read `Alias (system.name)`; JSON keeps the identity.
+            let names = ferryman_channel::names::Names::here();
             if json {
                 println!("{}", serde_json::to_string_pretty(&entries)?);
             } else if entries.is_empty() {
                 println!("no hand-ins in {}", handin::work_dir(&route).display());
             } else {
                 for entry in &entries {
+                    let who = names
+                        .as_ref()
+                        .map_or_else(|| entry.agent.clone(), |n| n.label(&entry.agent));
                     println!(
                         "  {:<24} {:<10} signature {:<11} {} ({} file(s))",
                         entry.order,
                         entry.status.as_str(),
                         entry.signature,
-                        entry.agent,
+                        who,
                         entry.files
                     );
                 }
